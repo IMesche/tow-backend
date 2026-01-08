@@ -42,7 +42,7 @@ app.use((req, res, next) => {
 // ============================================
 // Health Check
 // ============================================
-app.get('/health', (req, res) => {
+const healthResponse = (req, res) => {
   res.json({
     status: 'healthy',
     timestamp: Date.now(),
@@ -52,7 +52,9 @@ app.get('/health', (req, res) => {
       api: 'running'
     }
   });
-});
+};
+app.get('/health', healthResponse);
+app.get('/api/health', healthResponse);
 
 // ============================================
 // API Routes
