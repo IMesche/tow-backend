@@ -15,14 +15,14 @@
 
 const express = require('express');
 const router = express.Router();
-const { requireAuth, requireRole } = require('../middleware/auth');
+const { requireAdmin } = require('../middleware/auth');
 const db = require('../models/db');
 
 // ============================================
 // GET /api/templates
 // List templates with optional filters
 // ============================================
-router.get('/', requireAuth, async (req, res, next) => {
+router.get('/', requireAdmin, async (req, res, next) => {
     try {
         const { layer, category, status, search, limit = 100, offset = 0 } = req.query;
 
@@ -72,7 +72,7 @@ router.get('/', requireAuth, async (req, res, next) => {
 // GET /api/templates/:id
 // Get single template by ID
 // ============================================
-router.get('/:id', requireAuth, async (req, res, next) => {
+router.get('/:id', requireAdmin, async (req, res, next) => {
     try {
         const template = await db.getTemplate(req.params.id);
 
@@ -93,7 +93,7 @@ router.get('/:id', requireAuth, async (req, res, next) => {
 // POST /api/templates
 // Create new template (requires admin or creator role)
 // ============================================
-router.post('/', requireAuth, requireRole(['admin', 'creator']), async (req, res, next) => {
+router.post('/', requireAdmin, async (req, res, next) => {
     try {
         const templateData = req.body;
 
@@ -145,9 +145,9 @@ router.post('/', requireAuth, requireRole(['admin', 'creator']), async (req, res
             ...templateData,
             status: templateData.status || 'draft',
             createdAt: Date.now(),
-            createdBy: req.user.id,
+            createdBy: req.admin.id,
             updatedAt: Date.now(),
-            updatedBy: req.user.id,
+            updatedBy: req.admin.id,
             version: 1
         };
 
@@ -156,7 +156,7 @@ router.post('/', requireAuth, requireRole(['admin', 'creator']), async (req, res
         // Log audit event
         await db.logAudit({
             action: 'template.create',
-            userId: req.user.id,
+            userId: req.admin.id,
             targetId: template.id,
             details: { name: template.name, category: template.category }
         });
@@ -171,7 +171,7 @@ router.post('/', requireAuth, requireRole(['admin', 'creator']), async (req, res
 // PUT /api/templates/:id
 // Update template (requires admin or creator role)
 // ============================================
-router.put('/:id', requireAuth, requireRole(['admin', 'creator']), async (req, res, next) => {
+router.put('/:id', requireAdmin, async (req, res, next) => {
     try {
         const templateId = req.params.id;
         const updates = req.body;
@@ -210,7 +210,7 @@ router.put('/:id', requireAuth, requireRole(['admin', 'creator']), async (req, r
             ...updates,
             id: templateId, // Ensure ID doesn't change
             updatedAt: Date.now(),
-            updatedBy: req.user.id,
+            updatedBy: req.admin.id,
             version: (existing.version || 0) + 1
         };
 
@@ -219,7 +219,7 @@ router.put('/:id', requireAuth, requireRole(['admin', 'creator']), async (req, r
         // Log audit event
         await db.logAudit({
             action: 'template.update',
-            userId: req.user.id,
+            userId: req.admin.id,
             targetId: templateId,
             details: { changes: Object.keys(updates) }
         });
@@ -234,7 +234,7 @@ router.put('/:id', requireAuth, requireRole(['admin', 'creator']), async (req, r
 // DELETE /api/templates/:id
 // Soft delete template (requires admin role)
 // ============================================
-router.delete('/:id', requireAuth, requireRole(['admin']), async (req, res, next) => {
+router.delete('/:id', requireAdmin, async (req, res, next) => {
     try {
         const templateId = req.params.id;
 
@@ -251,7 +251,7 @@ router.delete('/:id', requireAuth, requireRole(['admin']), async (req, res, next
             ...existing,
             status: 'deleted',
             deletedAt: Date.now(),
-            deletedBy: req.user.id
+            deletedBy: req.admin.id
         };
 
         await db.updateTemplate(templateId, template);
@@ -259,7 +259,7 @@ router.delete('/:id', requireAuth, requireRole(['admin']), async (req, res, next
         // Log audit event
         await db.logAudit({
             action: 'template.delete',
-            userId: req.user.id,
+            userId: req.admin.id,
             targetId: templateId,
             details: { name: existing.name }
         });
@@ -274,7 +274,7 @@ router.delete('/:id', requireAuth, requireRole(['admin']), async (req, res, next
 // POST /api/templates/:id/publish
 // Publish a draft template (requires admin role)
 // ============================================
-router.post('/:id/publish', requireAuth, requireRole(['admin']), async (req, res, next) => {
+router.post('/:id/publish', requireAdmin, async (req, res, next) => {
     try {
         const templateId = req.params.id;
 
@@ -306,7 +306,7 @@ router.post('/:id/publish', requireAuth, requireRole(['admin']), async (req, res
             ...existing,
             status: 'published',
             publishedAt: Date.now(),
-            publishedBy: req.user.id
+            publishedBy: req.admin.id
         };
 
         await db.updateTemplate(templateId, template);
@@ -314,7 +314,7 @@ router.post('/:id/publish', requireAuth, requireRole(['admin']), async (req, res
         // Log audit event
         await db.logAudit({
             action: 'template.publish',
-            userId: req.user.id,
+            userId: req.admin.id,
             targetId: templateId,
             details: { name: existing.name }
         });
@@ -329,7 +329,7 @@ router.post('/:id/publish', requireAuth, requireRole(['admin']), async (req, res
 // GET /api/templates/:id/instances
 // Get instances of a template (items minted from it)
 // ============================================
-router.get('/:id/instances', requireAuth, async (req, res, next) => {
+router.get('/:id/instances', requireAdmin, async (req, res, next) => {
     try {
         const templateId = req.params.id;
         const { limit = 50, offset = 0 } = req.query;
@@ -364,7 +364,7 @@ router.get('/:id/instances', requireAuth, async (req, res, next) => {
 // GET /api/templates/stats
 // Get template statistics
 // ============================================
-router.get('/stats/summary', requireAuth, async (req, res, next) => {
+router.get('/stats/summary', requireAdmin, async (req, res, next) => {
     try {
         const templates = await db.getTemplates();
 
