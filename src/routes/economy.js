@@ -74,6 +74,32 @@ router.get('/metrics', optionalAdmin, (req, res) => {
 });
 
 /**
+ * GET /api/economy/top-templates
+ * Get top templates by sales volume
+ */
+router.get('/top-templates', optionalAdmin, (req, res) => {
+  const { limit = 10, days = 30 } = req.query;
+  const now = Date.now();
+  const cutoff = now - (parseInt(days) * 86400000);
+
+  const templates = db.prepare(`
+    SELECT
+      template_id,
+      COUNT(*) as sales_count,
+      SUM(price) as total_volume,
+      AVG(price) as avg_price,
+      MAX(sold_at) as last_sale
+    FROM sales_history
+    WHERE sold_at > ?
+    GROUP BY template_id
+    ORDER BY total_volume DESC
+    LIMIT ?
+  `).all(cutoff, parseInt(limit));
+
+  res.json(templates);
+});
+
+/**
  * GET /api/economy/sales
  * Get sales history
  */

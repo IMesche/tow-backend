@@ -48,26 +48,10 @@ router.get('/', optionalAdmin, (req, res) => {
 });
 
 /**
- * GET /api/policies/:id
- * Get single policy by ID
- */
-router.get('/:id', optionalAdmin, (req, res) => {
-  const policy = db.prepare('SELECT * FROM policies WHERE id = ?').get(req.params.id);
-
-  if (!policy) {
-    return res.status(404).json({ error: 'Policy not found', code: 'NOT_FOUND' });
-  }
-
-  res.json({
-    ...policy,
-    rules: JSON.parse(policy.rules)
-  });
-});
-
-/**
  * GET /api/policies/resolve/:type
  * Resolve effective policy for a type and location context
  * Query params: region, country, city, venue_id, quest_id
+ * NOTE: Must be defined BEFORE /:id to avoid route conflict
  */
 router.get('/resolve/:type', optionalAdmin, (req, res) => {
   const { type } = req.params;
@@ -124,6 +108,23 @@ router.get('/resolve/:type', optionalAdmin, (req, res) => {
   }
 
   res.status(404).json({ error: 'No policy found for this context', code: 'NO_POLICY' });
+});
+
+/**
+ * GET /api/policies/:id
+ * Get single policy by ID
+ */
+router.get('/:id', optionalAdmin, (req, res) => {
+  const policy = db.prepare('SELECT * FROM policies WHERE id = ?').get(req.params.id);
+
+  if (!policy) {
+    return res.status(404).json({ error: 'Policy not found', code: 'NOT_FOUND' });
+  }
+
+  res.json({
+    ...policy,
+    rules: JSON.parse(policy.rules)
+  });
 });
 
 /**
