@@ -73,6 +73,33 @@ sqlite.exec(`
     )
 `);
 
+// Create admins table if not exists
+sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS admins (
+        id TEXT PRIMARY KEY,
+        email TEXT UNIQUE NOT NULL,
+        password_hash TEXT NOT NULL,
+        name TEXT NOT NULL,
+        role TEXT DEFAULT 'admin',
+        permissions TEXT DEFAULT '[]',
+        is_active INTEGER DEFAULT 1,
+        created_at INTEGER,
+        last_login INTEGER
+    )
+`);
+
+// Seed default admin if none exists
+const adminCount = sqlite.prepare('SELECT COUNT(*) as count FROM admins').get();
+if (adminCount.count === 0) {
+    const bcrypt = require('bcryptjs');
+    const hash = bcrypt.hashSync('admin123', 10);
+    sqlite.prepare(`
+        INSERT INTO admins (id, email, password_hash, name, role, permissions, is_active, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run('admin_001', 'admin@tow.game', hash, 'Admin', 'admin', '["*"]', 1, Date.now());
+    console.log('Created default admin: admin@tow.game / admin123');
+}
+
 console.log('Database connected:', dbPath);
 
 // ============================================
@@ -82,6 +109,9 @@ console.log('Database connected:', dbPath);
 const db = {
     // Raw SQLite access
     sqlite,
+
+    // Expose prepare for direct queries
+    prepare: (sql) => sqlite.prepare(sql),
 
     // ==================== TEMPLATES ====================
 
