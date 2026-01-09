@@ -301,6 +301,34 @@ sqlite.exec(`
     )
 `);
 
+// Create quests table
+sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS quests (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        description TEXT,
+        author_id TEXT,
+        author_name TEXT,
+        status TEXT DEFAULT 'draft',
+        version INTEGER DEFAULT 1,
+        data JSON,
+        world JSON,
+        metadata JSON,
+        tags TEXT,
+        age_rating INTEGER DEFAULT 0,
+        location_id TEXT,
+        is_public INTEGER DEFAULT 0,
+        play_count INTEGER DEFAULT 0,
+        rating_sum INTEGER DEFAULT 0,
+        rating_count INTEGER DEFAULT 0,
+        created_at INTEGER,
+        updated_at INTEGER,
+        published_at INTEGER,
+        deleted_at INTEGER,
+        FOREIGN KEY (location_id) REFERENCES locations(id)
+    )
+`);
+
 // Create economy_metrics table
 sqlite.exec(`
     CREATE TABLE IF NOT EXISTS economy_metrics (
