@@ -70,6 +70,7 @@ app.use('/api/locations', locationsRoutes);
 app.use('/api/audit', auditRoutes);
 app.use('/api/metrics', metricsRoutes);
 app.use('/api/templates', templatesRoutes);
+app.use('/api/item-templates', templatesRoutes);  // Alias for admin client
 
 // ============================================
 // Error Handler

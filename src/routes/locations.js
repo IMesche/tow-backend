@@ -9,6 +9,31 @@ const { requireAdmin, optionalAdmin } = require('../middleware/auth');
 const router = express.Router();
 
 /**
+ * GET /api/locations/hierarchy
+ * Get location hierarchy (regions -> countries -> cities)
+ */
+router.get('/hierarchy', optionalAdmin, (req, res) => {
+  // Get all active locations
+  const locations = db.prepare('SELECT * FROM locations WHERE is_active = 1 ORDER BY type, name').all();
+
+  // Build hierarchy
+  const regions = locations.filter(l => l.type === 'region').map(r => ({
+    ...r,
+    policies: r.policies ? JSON.parse(r.policies) : [],
+    countries: locations.filter(c => c.type === 'country' && c.parent_id === r.id).map(c => ({
+      ...c,
+      policies: c.policies ? JSON.parse(c.policies) : [],
+      cities: locations.filter(city => city.type === 'city' && city.parent_id === c.id).map(city => ({
+        ...city,
+        policies: city.policies ? JSON.parse(city.policies) : []
+      }))
+    }))
+  }));
+
+  res.json(regions);
+});
+
+/**
  * GET /api/locations
  * List locations
  */
