@@ -26,6 +26,9 @@ git add -A && git commit -m "message" && git push
 ## API Endpoints
 
 - `/api/auth/*` - Authentication
+- `/api/quests/*` - Quest CRUD, publish, duplicate
+- `/api/assets/*` - Asset library (audio, images)
+- `/api/entities/*` - Entity templates
 - `/api/economy/*` - Economy metrics
 - `/api/alerts/*` - Alert system
 - `/api/ai/*` - AI recommendations

@@ -20,6 +20,7 @@ const auditRoutes = require('./routes/audit');
 const metricsRoutes = require('./routes/metrics');
 const templatesRoutes = require('./routes/templates');
 const questsRoutes = require('./routes/quests');
+const osmRoutes = require('./routes/osm');
 
 const app = express();
 const PORT = process.env.PORT || 3500;
@@ -73,6 +74,7 @@ app.use('/api/metrics', metricsRoutes);
 app.use('/api/templates', templatesRoutes);
 app.use('/api/item-templates', templatesRoutes);  // Alias for admin client
 app.use('/api/quests', questsRoutes);
+app.use('/api/osm', osmRoutes);
 
 // ============================================
 // Error Handler
