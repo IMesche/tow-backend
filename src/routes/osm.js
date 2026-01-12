@@ -363,13 +363,20 @@ function getRoadWidth(type) {
     return widths[type] || 5;
 }
 
+// Overpass mirrors for failover
+const OVERPASS_MIRRORS = [
+    'https://overpass-api.de/api/interpreter',
+    'https://overpass.kumi.systems/api/interpreter',
+    'https://maps.mail.ru/osm/tools/overpass/api/interpreter'
+];
+
 /**
- * Fetch all OSM features for a tile from Overpass
+ * Fetch all OSM features for a tile from Overpass with retry
  */
 async function fetchTileFromOverpass(south, west, north, east) {
     // Single query for all feature types
     const query = `
-        [out:json][timeout:30];
+        [out:json][timeout:25];
         (
             // Buildings
             way["building"](${south},${west},${north},${east});
@@ -393,21 +400,45 @@ async function fetchTileFromOverpass(south, west, north, east) {
         out body geom;
     `;
 
-    const overpassUrl = 'https://overpass-api.de/api/interpreter';
+    let lastError = null;
 
-    const response = await fetch(overpassUrl, {
-        method: 'POST',
-        body: `data=${encodeURIComponent(query)}`,
-        headers: {
-            'Content-Type': 'application/x-www-form-urlencoded'
+    // Try each mirror in sequence
+    for (const overpassUrl of OVERPASS_MIRRORS) {
+        try {
+            console.log(`OSM Tile: Trying ${overpassUrl.split('/')[2]}...`);
+
+            const controller = new AbortController();
+            const timeout = setTimeout(() => controller.abort(), 20000); // 20s timeout
+
+            const response = await fetch(overpassUrl, {
+                method: 'POST',
+                body: `data=${encodeURIComponent(query)}`,
+                headers: {
+                    'Content-Type': 'application/x-www-form-urlencoded'
+                },
+                signal: controller.signal
+            });
+
+            clearTimeout(timeout);
+
+            if (response.ok) {
+                const data = await response.json();
+                console.log(`OSM Tile: Success from ${overpassUrl.split('/')[2]}`);
+                return data;
+            }
+
+            lastError = new Error(`HTTP ${response.status}`);
+            console.log(`OSM Tile: ${overpassUrl.split('/')[2]} returned ${response.status}, trying next...`);
+
+        } catch (err) {
+            lastError = err;
+            console.log(`OSM Tile: ${overpassUrl.split('/')[2]} failed: ${err.message}, trying next...`);
         }
-    });
-
-    if (!response.ok) {
-        throw new Error(`Overpass API error: ${response.status}`);
     }
 
-    return await response.json();
+    // All mirrors failed - return null instead of throwing
+    console.log('OSM Tile: All Overpass mirrors failed');
+    return null;
 }
 
 /**
@@ -600,12 +631,13 @@ router.get('/tile', async (req, res) => {
         const now = Date.now();
         const expiresAt = now + CACHE_TTL;
 
-        if (cached && now - cached.timestamp < CACHE_TTL) {
+        const entryTTL = cached?.ttl || CACHE_TTL;
+        if (cached && now - cached.timestamp < entryTTL) {
             return res.json({
                 ...cached.data,
                 source: 'cache',
                 generatedAt: cached.timestamp,
-                expiresAt: cached.timestamp + CACHE_TTL
+                expiresAt: cached.timestamp + entryTTL
             });
         }
 
@@ -613,8 +645,25 @@ router.get('/tile', async (req, res) => {
         console.log(`OSM Tile: Fetching ${tileId} bbox ${south},${west},${north},${east}`);
         const overpassData = await fetchTileFromOverpass(south, west, north, east);
 
-        // Process features to local coordinates
-        const features = processTileFeatures(overpassData, tileOrigin, metersPerDegLng);
+        // Process features to local coordinates (or empty if Overpass failed)
+        let features;
+        let source = 'overpass';
+
+        if (overpassData && overpassData.elements) {
+            features = processTileFeatures(overpassData, tileOrigin, metersPerDegLng);
+        } else {
+            // Overpass failed - return empty tile so frontend can still render terrain
+            console.log(`OSM Tile: Returning empty tile for ${tileId} (Overpass unavailable)`);
+            features = {
+                buildings: [],
+                roads: [],
+                water: [],
+                landuse: [],
+                rail: [],
+                poi: []
+            };
+            source = 'empty';
+        }
 
         // Build response
         const responseData = {
@@ -629,7 +678,7 @@ router.get('/tile', async (req, res) => {
             metersPerDegLng,
             generatedAt: now,
             expiresAt,
-            source: 'overpass',
+            source,
             dataVersion: 1,
             features,
             elevation: {
@@ -648,10 +697,12 @@ router.get('/tile', async (req, res) => {
             }
         };
 
-        // Cache result
+        // Cache result (shorter TTL for empty tiles)
+        const cacheTTL = source === 'empty' ? 5 * 60 * 1000 : CACHE_TTL;  // 5 min for empty, 24h for full
         cache.set(cacheKey, {
             data: responseData,
-            timestamp: now
+            timestamp: now,
+            ttl: cacheTTL
         });
 
         // Clean old cache entries
