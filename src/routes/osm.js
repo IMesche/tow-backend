@@ -1,10 +1,243 @@
 /**
  * TOW Backend - OSM Proxy Routes
  * Proxies OpenStreetMap Overpass API with caching and rate limiting
+ * Now with elevation support from Malta 1m DTM
  */
 
 const express = require('express');
 const router = express.Router();
+
+// ============================================
+// Elevation System - Malta 1m DTM via WCS
+// ============================================
+
+// Malta WCS endpoint
+const MALTA_WCS_URL = 'https://malta.coverage.wetransform.eu/dtm_1m_2018/ows';
+const MALTA_COVERAGE_ID = 'dtm_1m_2018';
+
+// Malta bounds in WGS84 (approximate)
+const MALTA_BOUNDS = {
+    south: 35.78,
+    north: 36.10,
+    west: 14.13,
+    east: 14.62
+};
+
+// UTM Zone 33N parameters
+const UTM_ZONE_33N = {
+    falseEasting: 500000,
+    falseNorthing: 0,
+    scaleFactor: 0.9996,
+    centralMeridian: 15  // degrees
+};
+
+/**
+ * Convert WGS84 (lat/lng) to UTM Zone 33N
+ */
+function wgs84ToUtm33N(lat, lng) {
+    const a = 6378137;  // WGS84 semi-major axis
+    const f = 1 / 298.257223563;  // WGS84 flattening
+    const k0 = UTM_ZONE_33N.scaleFactor;
+    const lon0 = UTM_ZONE_33N.centralMeridian * Math.PI / 180;
+
+    const e2 = 2 * f - f * f;  // First eccentricity squared
+    const e4 = e2 * e2;
+    const e6 = e4 * e2;
+
+    const phi = lat * Math.PI / 180;
+    const lambda = lng * Math.PI / 180;
+
+    const N = a / Math.sqrt(1 - e2 * Math.sin(phi) * Math.sin(phi));
+    const T = Math.tan(phi) * Math.tan(phi);
+    const C = (e2 / (1 - e2)) * Math.cos(phi) * Math.cos(phi);
+    const A = Math.cos(phi) * (lambda - lon0);
+
+    const M = a * (
+        (1 - e2/4 - 3*e4/64 - 5*e6/256) * phi -
+        (3*e2/8 + 3*e4/32 + 45*e6/1024) * Math.sin(2*phi) +
+        (15*e4/256 + 45*e6/1024) * Math.sin(4*phi) -
+        (35*e6/3072) * Math.sin(6*phi)
+    );
+
+    const easting = UTM_ZONE_33N.falseEasting + k0 * N * (
+        A + (1 - T + C) * A*A*A / 6 +
+        (5 - 18*T + T*T + 72*C - 58*(e2/(1-e2))) * A*A*A*A*A / 120
+    );
+
+    const northing = UTM_ZONE_33N.falseNorthing + k0 * (
+        M + N * Math.tan(phi) * (
+            A*A / 2 +
+            (5 - T + 9*C + 4*C*C) * A*A*A*A / 24 +
+            (61 - 58*T + T*T + 600*C - 330*(e2/(1-e2))) * A*A*A*A*A*A / 720
+        )
+    );
+
+    return { easting, northing };
+}
+
+/**
+ * Check if point is within Malta bounds
+ */
+function isInMalta(lat, lng) {
+    return lat >= MALTA_BOUNDS.south && lat <= MALTA_BOUNDS.north &&
+           lng >= MALTA_BOUNDS.west && lng <= MALTA_BOUNDS.east;
+}
+
+/**
+ * Fetch elevation grid from Malta WCS for a tile
+ * Returns 11x11 grid of heights for 200m tile
+ */
+async function fetchMaltaElevation(south, west, north, east) {
+    // Check if tile is in Malta
+    const centreL = (parseFloat(south) + parseFloat(north)) / 2;
+    const centreN = (parseFloat(west) + parseFloat(east)) / 2;
+
+    if (!isInMalta(centreL, centreN)) {
+        return null;  // Outside Malta, no elevation data
+    }
+
+    try {
+        // Convert corners to UTM
+        const sw = wgs84ToUtm33N(parseFloat(south), parseFloat(west));
+        const ne = wgs84ToUtm33N(parseFloat(north), parseFloat(east));
+
+        // WCS GetCoverage request for small subset
+        const wcsUrl = `${MALTA_WCS_URL}?` +
+            `SERVICE=WCS&VERSION=2.0.1&REQUEST=GetCoverage` +
+            `&COVERAGEID=${MALTA_COVERAGE_ID}` +
+            `&FORMAT=image/tiff` +
+            `&SUBSET=E(${Math.floor(sw.easting)},${Math.ceil(ne.easting)})` +
+            `&SUBSET=N(${Math.floor(sw.northing)},${Math.ceil(ne.northing)})`;
+
+        console.log(`Elevation: Fetching Malta DTM for tile`);
+
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 10000);  // 10s timeout
+
+        const response = await fetch(wcsUrl, { signal: controller.signal });
+        clearTimeout(timeout);
+
+        if (!response.ok) {
+            console.log(`Elevation: WCS returned ${response.status}`);
+            return null;
+        }
+
+        // Read response as buffer
+        const buffer = await response.arrayBuffer();
+        const data = new Uint8Array(buffer);
+
+        // Parse simple TIFF to extract elevation values
+        const elevations = parseTiffElevation(data);
+
+        if (!elevations) {
+            return null;
+        }
+
+        // Resample to 11x11 grid for 200m tile (~18m spacing)
+        const grid = resampleToGrid(elevations, 11);
+
+        return {
+            mode: 'grid',
+            gridSize: 11,
+            stepM: 20,  // 200m / 10 = 20m between samples
+            heights: grid
+        };
+
+    } catch (error) {
+        console.log(`Elevation: Error fetching Malta DTM: ${error.message}`);
+        return null;
+    }
+}
+
+/**
+ * Parse TIFF elevation data (simplified parser for uncompressed 8-bit TIFF)
+ */
+function parseTiffElevation(data) {
+    if (data.length < 100) return null;
+
+    // Check TIFF magic
+    if (data[0] !== 0x49 || data[1] !== 0x49) {  // Little-endian II
+        return null;
+    }
+
+    // Read IFD offset
+    const ifdOffset = data[4] | (data[5] << 8) | (data[6] << 16) | (data[7] << 24);
+
+    // Read number of IFD entries
+    const numEntries = data[ifdOffset] | (data[ifdOffset + 1] << 8);
+
+    let width = 0, height = 0, stripOffset = 0;
+
+    // Parse IFD entries
+    for (let i = 0; i < numEntries; i++) {
+        const entryOffset = ifdOffset + 2 + (i * 12);
+        const tag = data[entryOffset] | (data[entryOffset + 1] << 8);
+        const value = data[entryOffset + 8] | (data[entryOffset + 9] << 8) |
+                      (data[entryOffset + 10] << 16) | (data[entryOffset + 11] << 24);
+
+        if (tag === 256) width = value;
+        if (tag === 257) height = value;
+        if (tag === 273) stripOffset = value;
+    }
+
+    if (width === 0 || height === 0 || stripOffset === 0) {
+        return null;
+    }
+
+    // Extract pixel values (8-bit elevations in metres)
+    const pixels = [];
+    for (let y = 0; y < height; y++) {
+        const row = [];
+        for (let x = 0; x < width; x++) {
+            const idx = stripOffset + (y * width) + x;
+            row.push(data[idx] || 0);
+        }
+        pixels.push(row);
+    }
+
+    return { width, height, pixels };
+}
+
+/**
+ * Resample elevation grid to target size using bilinear interpolation
+ */
+function resampleToGrid(elevData, targetSize) {
+    const { width, height, pixels } = elevData;
+    const grid = [];
+
+    for (let ty = 0; ty < targetSize; ty++) {
+        for (let tx = 0; tx < targetSize; tx++) {
+            // Map target coords to source coords
+            const sx = (tx / (targetSize - 1)) * (width - 1);
+            const sy = (ty / (targetSize - 1)) * (height - 1);
+
+            // Bilinear interpolation
+            const x0 = Math.floor(sx);
+            const y0 = Math.floor(sy);
+            const x1 = Math.min(x0 + 1, width - 1);
+            const y1 = Math.min(y0 + 1, height - 1);
+
+            const fx = sx - x0;
+            const fy = sy - y0;
+
+            const v00 = pixels[y0]?.[x0] || 0;
+            const v01 = pixels[y0]?.[x1] || 0;
+            const v10 = pixels[y1]?.[x0] || 0;
+            const v11 = pixels[y1]?.[x1] || 0;
+
+            const v = (1-fx)*(1-fy)*v00 + fx*(1-fy)*v01 +
+                      (1-fx)*fy*v10 + fx*fy*v11;
+
+            grid.push(Math.round(v * 10) / 10);  // Round to 0.1m
+        }
+    }
+
+    return grid;
+}
+
+// Elevation cache (separate from OSM cache)
+const elevationCache = new Map();
+const ELEVATION_CACHE_TTL = 7 * 24 * 60 * 60 * 1000;  // 7 days
 
 // In-memory cache (for Render free tier - no Redis)
 const cache = new Map();
@@ -665,6 +898,37 @@ router.get('/tile', async (req, res) => {
             source = 'empty';
         }
 
+        // Fetch elevation data (with caching)
+        const elevCacheKey = `elev:${tileId}`;
+        let elevation = elevationCache.get(elevCacheKey);
+
+        if (!elevation || (now - elevation.timestamp > ELEVATION_CACHE_TTL)) {
+            const elevData = await fetchMaltaElevation(south, west, north, east);
+
+            if (elevData) {
+                elevation = {
+                    ...elevData,
+                    origin: { x: 0, z: 0 },
+                    timestamp: now
+                };
+                elevationCache.set(elevCacheKey, elevation);
+                console.log(`Elevation: Cached ${tileId} (${elevData.heights.length} samples)`);
+            } else {
+                // No elevation data available (outside Malta or error)
+                elevation = {
+                    mode: 'none',
+                    gridSize: 0,
+                    origin: { x: 0, z: 0 },
+                    stepM: 0,
+                    heights: [],
+                    timestamp: now
+                };
+                // Cache negative result for 1 hour to avoid repeated failures
+                elevation.shortTTL = true;
+                elevationCache.set(elevCacheKey, elevation);
+            }
+        }
+
         // Build response
         const responseData = {
             tileId,
@@ -682,11 +946,11 @@ router.get('/tile', async (req, res) => {
             dataVersion: 1,
             features,
             elevation: {
-                mode: 'none',
-                gridSize: 0,
-                origin: { x: 0, z: 0 },
-                stepM: 0,
-                heights: []
+                mode: elevation.mode,
+                gridSize: elevation.gridSize || 0,
+                origin: elevation.origin || { x: 0, z: 0 },
+                stepM: elevation.stepM || 0,
+                heights: elevation.heights || []
             },
             stats: {
                 buildings: features.buildings.length,
