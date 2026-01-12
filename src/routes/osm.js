@@ -314,4 +314,367 @@ router.get('/status', (req, res) => {
     });
 });
 
+// ============================================
+// Phase 2: Tile-based endpoint
+// ============================================
+
+// Tile size in metres (matching TileManager)
+const TILE_SIZE_M = 200;
+
+// Metres per degree at equator (approximately)
+const METERS_PER_DEG_LAT = 111320;
+
+/**
+ * Convert GPS to local tile coordinates (metres from tile origin)
+ */
+function gpsToTileLocal(lat, lng, tileOrigin, metersPerDegLng) {
+    return {
+        x: (lng - tileOrigin.lng) * metersPerDegLng,
+        z: (lat - tileOrigin.lat) * METERS_PER_DEG_LAT
+    };
+}
+
+/**
+ * Get tile ID from bbox (for caching)
+ */
+function getTileId(south, west, north, east) {
+    // Use bbox centre rounded to tile grid
+    const centreLat = (parseFloat(south) + parseFloat(north)) / 2;
+    const centreLng = (parseFloat(west) + parseFloat(east)) / 2;
+    return `tile_${centreLat.toFixed(4)}_${centreLng.toFixed(4)}`;
+}
+
+/**
+ * Estimate road width from highway type
+ */
+function getRoadWidth(type) {
+    const widths = {
+        'motorway': 14, 'motorway_link': 8,
+        'trunk': 12, 'trunk_link': 7,
+        'primary': 10, 'primary_link': 6,
+        'secondary': 8, 'secondary_link': 5,
+        'tertiary': 7, 'tertiary_link': 5,
+        'residential': 6, 'living_street': 5,
+        'service': 4, 'unclassified': 5,
+        'footway': 2, 'pedestrian': 3,
+        'path': 1.5, 'cycleway': 2,
+        'track': 3, 'steps': 2
+    };
+    return widths[type] || 5;
+}
+
+/**
+ * Fetch all OSM features for a tile from Overpass
+ */
+async function fetchTileFromOverpass(south, west, north, east) {
+    // Single query for all feature types
+    const query = `
+        [out:json][timeout:30];
+        (
+            // Buildings
+            way["building"](${south},${west},${north},${east});
+
+            // Roads and paths
+            way["highway"](${south},${west},${north},${east});
+
+            // Water bodies
+            way["natural"="water"](${south},${west},${north},${east});
+            way["waterway"](${south},${west},${north},${east});
+            relation["natural"="water"](${south},${west},${north},${east});
+
+            // Landuse (parks, forests, etc.)
+            way["leisure"="park"](${south},${west},${north},${east});
+            way["landuse"~"grass|forest|meadow|recreation_ground"](${south},${west},${north},${east});
+            way["natural"~"wood|grassland|scrub"](${south},${west},${north},${east});
+
+            // Railways
+            way["railway"~"rail|light_rail|tram|subway"](${south},${west},${north},${east});
+        );
+        out body geom;
+    `;
+
+    const overpassUrl = 'https://overpass-api.de/api/interpreter';
+
+    const response = await fetch(overpassUrl, {
+        method: 'POST',
+        body: `data=${encodeURIComponent(query)}`,
+        headers: {
+            'Content-Type': 'application/x-www-form-urlencoded'
+        }
+    });
+
+    if (!response.ok) {
+        throw new Error(`Overpass API error: ${response.status}`);
+    }
+
+    return await response.json();
+}
+
+/**
+ * Process Overpass response into structured tile features
+ * Converts GPS to local tile coordinates
+ */
+function processTileFeatures(overpassData, tileOrigin, metersPerDegLng) {
+    const features = {
+        buildings: [],
+        roads: [],
+        water: [],
+        landuse: [],
+        rail: [],
+        poi: []
+    };
+
+    // Hard caps per tile for performance
+    const MAX_BUILDINGS = 200;
+    const MAX_ROADS = 150;
+    const MAX_WATER = 50;
+    const MAX_LANDUSE = 50;
+    const MAX_RAIL = 30;
+
+    for (const el of overpassData.elements || []) {
+        if (el.type !== 'way' && el.type !== 'relation') continue;
+        if (!el.geometry || el.geometry.length < 2) continue;
+
+        const tags = el.tags || {};
+
+        // Convert geometry to local coords
+        const localGeom = el.geometry.map(p =>
+            gpsToTileLocal(p.lat, p.lon, tileOrigin, metersPerDegLng)
+        );
+
+        // Classify by tags
+        if (tags.building && features.buildings.length < MAX_BUILDINGS) {
+            // Calculate centroid and bounds
+            let sumX = 0, sumZ = 0;
+            let minX = Infinity, maxX = -Infinity;
+            let minZ = Infinity, maxZ = -Infinity;
+
+            for (const p of localGeom) {
+                sumX += p.x; sumZ += p.z;
+                minX = Math.min(minX, p.x); maxX = Math.max(maxX, p.x);
+                minZ = Math.min(minZ, p.z); maxZ = Math.max(maxZ, p.z);
+            }
+
+            features.buildings.push({
+                id: `way/${el.id}`,
+                footprint: localGeom.map(p => [p.x, p.z]),
+                center: { x: sumX / localGeom.length, z: sumZ / localGeom.length },
+                bounds: { minX, maxX, minZ, maxZ },
+                heightM: estimateHeight(tags),
+                minHeightM: parseFloat(tags['min_height']) || 0,
+                kind: tags.building,
+                tags: { building: tags.building, name: tags.name }
+            });
+        }
+        else if (tags.highway && features.roads.length < MAX_ROADS) {
+            features.roads.push({
+                id: `way/${el.id}`,
+                path: localGeom.map(p => [p.x, p.z]),
+                kind: tags.highway,
+                widthM: getRoadWidth(tags.highway),
+                surface: tags.surface || 'asphalt',
+                tags: { highway: tags.highway, name: tags.name, lanes: tags.lanes }
+            });
+        }
+        else if ((tags.natural === 'water' || tags.waterway) && features.water.length < MAX_WATER) {
+            features.water.push({
+                id: `way/${el.id}`,
+                polygon: localGeom.map(p => [p.x, p.z]),
+                kind: tags.waterway || 'water',
+                tags: { natural: tags.natural, waterway: tags.waterway, name: tags.name }
+            });
+        }
+        else if ((tags.leisure === 'park' || tags.landuse || tags.natural) &&
+                 !tags.building && !tags.highway && !tags.waterway &&
+                 features.landuse.length < MAX_LANDUSE) {
+            const kind = tags.leisure || tags.landuse || tags.natural;
+            if (['park', 'grass', 'forest', 'meadow', 'recreation_ground', 'wood', 'grassland', 'scrub'].includes(kind)) {
+                features.landuse.push({
+                    id: `way/${el.id}`,
+                    polygon: localGeom.map(p => [p.x, p.z]),
+                    kind: kind,
+                    tags: { leisure: tags.leisure, landuse: tags.landuse, natural: tags.natural, name: tags.name }
+                });
+            }
+        }
+        else if (tags.railway && features.rail.length < MAX_RAIL) {
+            features.rail.push({
+                id: `way/${el.id}`,
+                path: localGeom.map(p => [p.x, p.z]),
+                kind: tags.railway,
+                electrified: tags.electrified || 'no',
+                tags: { railway: tags.railway, name: tags.name }
+            });
+        }
+    }
+
+    return features;
+}
+
+/**
+ * GET /api/osm/tile
+ * Returns all OSM features for a tile in local coordinates
+ *
+ * Query params:
+ *   south, west, north, east - Bounding box coordinates
+ *   originLat, originLng - World origin for coordinate transformation (optional)
+ *
+ * Response contract:
+ * {
+ *   tileId: string,
+ *   bounds: { south, west, north, east },
+ *   tileOrigin: { lat, lng },  // SW corner of tile
+ *   generatedAt: number,
+ *   expiresAt: number,
+ *   source: 'overpass' | 'cache',
+ *   dataVersion: 1,
+ *   features: {
+ *     buildings: [{ id, footprint, center, bounds, heightM, minHeightM, kind, tags }],
+ *     roads: [{ id, path, kind, widthM, surface, tags }],
+ *     water: [{ id, polygon, kind, tags }],
+ *     landuse: [{ id, polygon, kind, tags }],
+ *     rail: [{ id, path, kind, electrified, tags }],
+ *     poi: []
+ *   },
+ *   elevation: {
+ *     mode: 'none' | 'grid',
+ *     gridSize: number,
+ *     origin: { x, z },
+ *     stepM: number,
+ *     heights: number[]
+ *   },
+ *   stats: {
+ *     buildings: number,
+ *     roads: number,
+ *     water: number,
+ *     landuse: number,
+ *     rail: number
+ *   }
+ * }
+ */
+router.get('/tile', async (req, res) => {
+    try {
+        const { south, west, north, east, originLat, originLng } = req.query;
+
+        // Validate params
+        if (!south || !west || !north || !east) {
+            return res.status(400).json({
+                error: 'Missing required parameters: south, west, north, east',
+                code: 'MISSING_PARAMS'
+            });
+        }
+
+        // Validate bbox size (max 0.25 km² for tiles)
+        const area = calculateArea(south, west, north, east);
+        if (area > 0.25) {
+            return res.status(400).json({
+                error: `Bounding box too large: ${area.toFixed(3)}km² (max 0.25km² for tiles)`,
+                code: 'BBOX_TOO_LARGE'
+            });
+        }
+
+        // Check rate limit
+        const sessionId = req.headers['x-session-id'] || req.ip;
+        if (!checkRateLimit(sessionId)) {
+            return res.status(429).json({
+                error: 'Rate limit exceeded. Max 10 requests per minute.',
+                code: 'RATE_LIMITED'
+            });
+        }
+
+        // Tile origin is SW corner
+        const tileOrigin = {
+            lat: parseFloat(south),
+            lng: parseFloat(west)
+        };
+
+        // Calculate metres per degree longitude at this latitude
+        const avgLat = (parseFloat(south) + parseFloat(north)) / 2;
+        const metersPerDegLng = METERS_PER_DEG_LAT * Math.cos(avgLat * Math.PI / 180);
+
+        // Cache key using tile ID
+        const tileId = getTileId(south, west, north, east);
+        const cacheKey = `tile:${tileId}`;
+        const cached = cache.get(cacheKey);
+
+        const now = Date.now();
+        const expiresAt = now + CACHE_TTL;
+
+        if (cached && now - cached.timestamp < CACHE_TTL) {
+            return res.json({
+                ...cached.data,
+                source: 'cache',
+                generatedAt: cached.timestamp,
+                expiresAt: cached.timestamp + CACHE_TTL
+            });
+        }
+
+        // Fetch from Overpass
+        console.log(`OSM Tile: Fetching ${tileId} bbox ${south},${west},${north},${east}`);
+        const overpassData = await fetchTileFromOverpass(south, west, north, east);
+
+        // Process features to local coordinates
+        const features = processTileFeatures(overpassData, tileOrigin, metersPerDegLng);
+
+        // Build response
+        const responseData = {
+            tileId,
+            bounds: {
+                south: parseFloat(south),
+                west: parseFloat(west),
+                north: parseFloat(north),
+                east: parseFloat(east)
+            },
+            tileOrigin,
+            metersPerDegLng,
+            generatedAt: now,
+            expiresAt,
+            source: 'overpass',
+            dataVersion: 1,
+            features,
+            elevation: {
+                mode: 'none',
+                gridSize: 0,
+                origin: { x: 0, z: 0 },
+                stepM: 0,
+                heights: []
+            },
+            stats: {
+                buildings: features.buildings.length,
+                roads: features.roads.length,
+                water: features.water.length,
+                landuse: features.landuse.length,
+                rail: features.rail.length
+            }
+        };
+
+        // Cache result
+        cache.set(cacheKey, {
+            data: responseData,
+            timestamp: now
+        });
+
+        // Clean old cache entries
+        if (cache.size > 1000) {
+            for (const [key, value] of cache) {
+                if (now - value.timestamp > CACHE_TTL) {
+                    cache.delete(key);
+                }
+            }
+        }
+
+        console.log(`OSM Tile: ${tileId} - ${features.buildings.length} buildings, ${features.roads.length} roads, ${features.water.length} water, ${features.landuse.length} landuse`);
+
+        res.json(responseData);
+
+    } catch (error) {
+        console.error('OSM tile error:', error);
+        res.status(500).json({
+            error: 'Failed to fetch tile data',
+            code: 'FETCH_ERROR',
+            details: error.message
+        });
+    }
+});
+
 module.exports = router;
