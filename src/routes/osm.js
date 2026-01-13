@@ -275,7 +275,7 @@ const CACHE_TTL = 24 * 60 * 60 * 1000;  // 24 hours
 
 // Rate limiting per session
 const rateLimits = new Map();
-const RATE_LIMIT = 10;  // requests per minute
+const RATE_LIMIT = 60;  // requests per minute (increased for tile loading)
 const RATE_WINDOW = 60 * 1000;  // 1 minute
 
 // ============================================
