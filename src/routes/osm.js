@@ -567,6 +567,9 @@ function gpsToTileLocal(lat, lng, tileOrigin, metersPerDegLng) {
     };
 }
 
+// Cache version - increment to invalidate old cached tiles
+const TILE_CACHE_VERSION = 2;  // v2: Added Malta elevation support
+
 /**
  * Get tile ID from bbox (for caching)
  */
@@ -574,7 +577,7 @@ function getTileId(south, west, north, east) {
     // Use bbox centre rounded to tile grid
     const centreLat = (parseFloat(south) + parseFloat(north)) / 2;
     const centreLng = (parseFloat(west) + parseFloat(east)) / 2;
-    return `tile_${centreLat.toFixed(4)}_${centreLng.toFixed(4)}`;
+    return `v${TILE_CACHE_VERSION}_tile_${centreLat.toFixed(4)}_${centreLng.toFixed(4)}`;
 }
 
 /**
