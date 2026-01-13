@@ -150,49 +150,79 @@ async function fetchMaltaElevation(south, west, north, east) {
 }
 
 /**
- * Parse TIFF elevation data (simplified parser for uncompressed 8-bit TIFF)
+ * Parse TIFF elevation data (handles stripped TIFFs from Malta WCS)
+ * Malta DTM uses multiple strips with 6 rows each
  */
 function parseTiffElevation(data) {
     if (data.length < 100) return null;
 
-    // Check TIFF magic
-    if (data[0] !== 0x49 || data[1] !== 0x49) {  // Little-endian II
+    // Check TIFF magic (little-endian)
+    if (data[0] !== 0x49 || data[1] !== 0x49) {
         return null;
     }
 
+    // Helper to read 16-bit and 32-bit values
+    const readU16 = (offset) => data[offset] | (data[offset + 1] << 8);
+    const readU32 = (offset) => data[offset] | (data[offset + 1] << 8) |
+                                (data[offset + 2] << 16) | (data[offset + 3] << 24);
+
     // Read IFD offset
-    const ifdOffset = data[4] | (data[5] << 8) | (data[6] << 16) | (data[7] << 24);
+    const ifdOffset = readU32(4);
+    const numEntries = readU16(ifdOffset);
 
-    // Read number of IFD entries
-    const numEntries = data[ifdOffset] | (data[ifdOffset + 1] << 8);
-
-    let width = 0, height = 0, stripOffset = 0;
+    let width = 0, height = 0;
+    let rowsPerStrip = 0;
+    let stripOffsetsPtr = 0, stripOffsetsCount = 0;
 
     // Parse IFD entries
     for (let i = 0; i < numEntries; i++) {
-        const entryOffset = ifdOffset + 2 + (i * 12);
-        const tag = data[entryOffset] | (data[entryOffset + 1] << 8);
-        const value = data[entryOffset + 8] | (data[entryOffset + 9] << 8) |
-                      (data[entryOffset + 10] << 16) | (data[entryOffset + 11] << 24);
+        const off = ifdOffset + 2 + (i * 12);
+        const tag = readU16(off);
+        const type = readU16(off + 2);
+        const count = readU32(off + 4);
+        const valueOrPtr = readU32(off + 8);
 
-        if (tag === 256) width = value;
-        if (tag === 257) height = value;
-        if (tag === 273) stripOffset = value;
+        if (tag === 256) width = valueOrPtr;          // ImageWidth
+        if (tag === 257) height = valueOrPtr;         // ImageLength
+        if (tag === 278) rowsPerStrip = valueOrPtr;   // RowsPerStrip
+        if (tag === 273) {                            // StripOffsets
+            stripOffsetsCount = count;
+            // If count > 1, value is pointer to array; otherwise it's the value
+            stripOffsetsPtr = (count > 1) ? valueOrPtr : off + 8;
+        }
     }
 
-    if (width === 0 || height === 0 || stripOffset === 0) {
+    if (width === 0 || height === 0 || stripOffsetsCount === 0) {
         return null;
     }
 
-    // Extract pixel values (8-bit elevations in metres)
+    // Default rowsPerStrip to full height if not specified
+    if (rowsPerStrip === 0) rowsPerStrip = height;
+
+    // Read all strip offsets
+    const stripOffsets = [];
+    for (let i = 0; i < stripOffsetsCount; i++) {
+        const offset = readU32(stripOffsetsPtr + i * 4);
+        stripOffsets.push(offset);
+    }
+
+    // Build pixel array from strips
     const pixels = [];
-    for (let y = 0; y < height; y++) {
-        const row = [];
-        for (let x = 0; x < width; x++) {
-            const idx = stripOffset + (y * width) + x;
-            row.push(data[idx] || 0);
+    let currentRow = 0;
+
+    for (let s = 0; s < stripOffsets.length && currentRow < height; s++) {
+        const stripStart = stripOffsets[s];
+        const rowsInStrip = Math.min(rowsPerStrip, height - currentRow);
+
+        for (let r = 0; r < rowsInStrip; r++) {
+            const row = [];
+            for (let x = 0; x < width; x++) {
+                const idx = stripStart + (r * width) + x;
+                row.push(data[idx] || 0);
+            }
+            pixels.push(row);
+            currentRow++;
         }
-        pixels.push(row);
     }
 
     return { width, height, pixels };
@@ -568,7 +598,7 @@ function gpsToTileLocal(lat, lng, tileOrigin, metersPerDegLng) {
 }
 
 // Cache version - increment to invalidate old cached tiles
-const TILE_CACHE_VERSION = 2;  // v2: Added Malta elevation support
+const TILE_CACHE_VERSION = 3;  // v3: Fixed stripped TIFF parsing for Malta elevation
 
 /**
  * Get tile ID from bbox (for caching)
