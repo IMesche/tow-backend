@@ -1030,4 +1030,144 @@ router.get('/tile', async (req, res) => {
     }
 });
 
+/**
+ * GET /api/osm/elevation/coarse
+ * Returns a large, low-resolution elevation grid for the entire play area
+ * Used to seed HeightPyramid coarse levels on startup
+ *
+ * Query params:
+ *   lat, lng - Center point
+ *   radiusKm - Radius in km (default 2.5 = 5km total coverage)
+ *   gridSize - Grid resolution (default 128)
+ *
+ * Response:
+ * {
+ *   gridSize: number,
+ *   bounds: { south, west, north, east },
+ *   worldBounds: { minX, maxX, minZ, maxZ },  // in metres from center
+ *   stepM: number,  // metres per sample
+ *   heights: number[]  // flat array, row-major (south to north)
+ * }
+ */
+router.get('/elevation/coarse', async (req, res) => {
+    try {
+        const lat = parseFloat(req.query.lat);
+        const lng = parseFloat(req.query.lng);
+        const radiusKm = parseFloat(req.query.radiusKm) || 2.5;
+        const gridSize = parseInt(req.query.gridSize) || 128;
+
+        if (isNaN(lat) || isNaN(lng)) {
+            return res.status(400).json({
+                error: 'Missing required parameters: lat, lng',
+                code: 'MISSING_PARAMS'
+            });
+        }
+
+        // Check if center is in Malta
+        if (!isInMalta(lat, lng)) {
+            return res.status(400).json({
+                error: 'Location outside Malta coverage',
+                code: 'OUTSIDE_COVERAGE'
+            });
+        }
+
+        // Calculate bounds
+        const latDelta = radiusKm / 111.32;  // ~111km per degree latitude
+        const lngDelta = radiusKm / (111.32 * Math.cos(lat * Math.PI / 180));
+
+        const south = lat - latDelta;
+        const north = lat + latDelta;
+        const west = lng - lngDelta;
+        const east = lng + lngDelta;
+
+        // Check cache
+        const cacheKey = `coarse:${lat.toFixed(4)}_${lng.toFixed(4)}_${radiusKm}_${gridSize}`;
+        const cached = elevationCache.get(cacheKey);
+        const now = Date.now();
+
+        if (cached && now - cached.timestamp < ELEVATION_CACHE_TTL) {
+            console.log(`Coarse elevation: returning cached data for ${cacheKey}`);
+            return res.json(cached.data);
+        }
+
+        console.log(`Coarse elevation: Fetching ${gridSize}x${gridSize} grid, ${radiusKm*2}km coverage around ${lat.toFixed(4)}, ${lng.toFixed(4)}`);
+
+        // Convert corners to UTM
+        const sw = wgs84ToUtm33N(south, west);
+        const ne = wgs84ToUtm33N(north, east);
+
+        // WCS GetCoverage request
+        const wcsUrl = `${MALTA_WCS_URL}?` +
+            `SERVICE=WCS&VERSION=2.0.1&REQUEST=GetCoverage` +
+            `&COVERAGEID=${MALTA_COVERAGE_ID}` +
+            `&FORMAT=image/tiff` +
+            `&SUBSET=E(${Math.floor(sw.easting)},${Math.ceil(ne.easting)})` +
+            `&SUBSET=N(${Math.floor(sw.northing)},${Math.ceil(ne.northing)})`;
+
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 30000);  // 30s timeout for large area
+
+        const response = await fetch(wcsUrl, { signal: controller.signal });
+        clearTimeout(timeout);
+
+        if (!response.ok) {
+            console.log(`Coarse elevation: WCS returned ${response.status}`);
+            return res.status(502).json({
+                error: 'Elevation service unavailable',
+                code: 'WCS_ERROR'
+            });
+        }
+
+        const buffer = await response.arrayBuffer();
+        const data = new Uint8Array(buffer);
+
+        // Parse TIFF
+        const elevations = parseTiffElevation(data);
+        if (!elevations) {
+            return res.status(502).json({
+                error: 'Failed to parse elevation data',
+                code: 'PARSE_ERROR'
+            });
+        }
+
+        // Resample to requested grid size
+        const grid = resampleToGrid(elevations, gridSize);
+
+        // Calculate world bounds in metres from center
+        const radiusM = radiusKm * 1000;
+        const stepM = (radiusM * 2) / (gridSize - 1);
+
+        const responseData = {
+            gridSize,
+            bounds: { south, west, north, east },
+            worldBounds: {
+                minX: -radiusM,
+                maxX: radiusM,
+                minZ: -radiusM,
+                maxZ: radiusM
+            },
+            stepM,
+            heights: grid
+        };
+
+        // Cache the result
+        elevationCache.set(cacheKey, {
+            data: responseData,
+            timestamp: now
+        });
+
+        console.log(`Coarse elevation: Cached ${gridSize}x${gridSize} grid (${grid.length} samples)`);
+
+        res.json(responseData);
+
+    } catch (error) {
+        console.error('Coarse elevation error:', error);
+        res.status(500).json({
+            error: 'Failed to fetch coarse elevation',
+            code: 'FETCH_ERROR',
+            details: error.message
+        });
+    }
+});
+
 module.exports = router;
