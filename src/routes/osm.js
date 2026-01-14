@@ -230,6 +230,8 @@ function parseTiffElevation(data) {
 
 /**
  * Resample elevation grid to target size using bilinear interpolation
+ * NOTE: TIFF stores rows top-to-bottom (north-to-south), but tile grid
+ * expects row 0 = south, row N = north. So we flip the Y axis.
  */
 function resampleToGrid(elevData, targetSize) {
     const { width, height, pixels } = elevData;
@@ -238,8 +240,11 @@ function resampleToGrid(elevData, targetSize) {
     for (let ty = 0; ty < targetSize; ty++) {
         for (let tx = 0; tx < targetSize; tx++) {
             // Map target coords to source coords
+            // X: left to right (same direction)
             const sx = (tx / (targetSize - 1)) * (width - 1);
-            const sy = (ty / (targetSize - 1)) * (height - 1);
+            // Y: FLIP! ty=0 (south in tile) should read from bottom of TIFF (height-1)
+            //         ty=max (north in tile) should read from top of TIFF (0)
+            const sy = (1 - ty / (targetSize - 1)) * (height - 1);
 
             // Bilinear interpolation
             const x0 = Math.floor(sx);
@@ -598,7 +603,7 @@ function gpsToTileLocal(lat, lng, tileOrigin, metersPerDegLng) {
 }
 
 // Cache version - increment to invalidate old cached tiles
-const TILE_CACHE_VERSION = 3;  // v3: Fixed stripped TIFF parsing for Malta elevation
+const TILE_CACHE_VERSION = 4;  // v4: Fixed Y-axis flip in elevation resampling (tile boundaries now align)
 
 /**
  * Get tile ID from bbox (for caching)
